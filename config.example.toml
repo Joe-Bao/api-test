@@ -1,0 +1,60 @@
+# anon-proxy 配置示例：复制成 config.toml 再改。
+# 只给自己用就保持 127.0.0.1；要让别人连进来改成 "0.0.0.0:8787"，并且一定要配好 [users]。
+listen = "127.0.0.1:8787"
+
+# ---- 上游：你自己的商业 API key，只从环境变量读取，不写进这个文件 ----
+[upstream.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+# 所有转发出去的请求都用这一个 UA，上游看到的永远是同一个客户端。可以改成任意固定字符串。
+user_agent = "codex_cli_rs/0.170.0 (Windows 10.0.26200; x86_64) WindowsTerminal"
+# extra_headers = { "OpenAI-Project" = "proj_xxx" }
+
+[upstream.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+# 也可以把 key 放进文件（相对本配置文件的目录），环境变量没设时读它；每次请求现读，换 key 不用重启
+# api_key_file = "key.txt"
+user_agent = "claude-cli/2.1.312 (external, cli)"
+
+[network]
+# 访问上游需要走代理时填写（支持 http://user:pass@host:port）；不填则读 HTTPS_PROXY 环境变量
+# upstream_proxy = "http://127.0.0.1:7890"
+timeout_seconds = 900
+
+[privacy]
+# 生成伪名和替身用的 HMAC 密钥，首次启动自动生成。别泄露，也别随便换（换了会让提示缓存失效）
+secret_file = "data/secret.key"
+# "none"：不给上游任何终端用户标识（默认）。
+# "pseudonym"：每个下游用户一个稳定的不可逆伪名（safety_identifier / metadata.user_id）。
+#   好处是某个下游用户违规时，上游可以只处理这个伪名，而不是整个 key 一起受罚。
+end_user_id = "none"
+# Responses API 一律 store=false，上游不在服务端保存回复（依赖 previous_response_id 的客户端会因此失效）
+force_store_false = true
+# 去掉 Claude Code 写在 system 第一段里的 x-anthropic-billing-header（客户端版本/启动方式）。
+# 组织里只有 Max/Team/Ultra 订阅附带的月度 API 额度时，Anthropic 靠这一段认出 `claude -p`；
+# 删掉后 `claude -p` 也会报 Credit balance too low，这种情况设成 false（见 README）
+strip_billing_header = true
+# Opus 5.5 / Fable 5.x 会校验回传的 thinking 块前面的历史是否被改过。"drop_block"：万一对不上，
+# 只丢弃那些 thinking 块继续回答（日志里记 thinking_dropped）；"error"：直接报错；"off"：不改动请求
+thinking_mismatch = "drop_block"
+# Codex 会把本机时区写进 <environment_context>，这里统一替换；留空则不改
+timezone = "UTC"
+# 填一个目录，就把每个发往上游的请求（脱敏后、key 已隐去）存一份，用来核查上游到底看到了什么
+audit_dir = ""
+
+[masking]
+secrets = true          # API key、token、私钥、password=xxx 这类赋值
+emails = true
+ips = true              # 回环/保留地址不动
+path_usernames = true   # C:\Users\<名字>、/Users/<名字>、/home/<名字>，学到的名字会在全文替换
+hostnames = true        # DESKTOP-XXXXXXX、xxx-MacBook-Pro.local
+git_remotes = true      # github.com/<组织>/<仓库> 等
+# 一定要脱敏的字面量：真名、公司名、内部域名、项目代号……（不区分大小写）
+literals = []
+# 不脱敏的值（不区分大小写）
+keep = ["git@github.com", "noreply@github.com", "noreply@anthropic.com", "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1"]
+
+# ---- 下游用户：网关 key = 别名。用 `python -m anon_proxy keygen 别名` 生成一行贴进来 ----
+[users]
+# "gk-把这里换成生成的key" = "alice"

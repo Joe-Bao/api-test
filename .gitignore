@@ -1,0 +1,7 @@
+# 含网关 key / HMAC 密钥 / 审计记录，不要提交
+config.toml
+key.txt
+*.key
+data/
+audit/
+__pycache__/

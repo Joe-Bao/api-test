@@ -1,0 +1,224 @@
+{
+  "report": "anon-proxy 测试结果与上下文",
+  "generated_at": "2026-11-24",
+  "privacy_note": "本文件不含任何 API key、网关 key、账户/组织/工作区 ID 和 request-id；本机用户名一律写作 <local-user>。测试用例里的用户名和时区都是虚构的。",
+  "project": {
+    "name": "anon-proxy",
+    "version": "0.1.0",
+    "summary": "放在 Codex CLI / Claude Code 和官方按量付费 API 之间的脱敏网关。下游请求进来后，客户端标识被删除或换成不可逆伪名，正文里的敏感字符串换成可还原的替身，再用网关所有者自己的 API key 转发；回复（含流式输出和工具调用参数）再把替身换回原文。",
+    "runtime": "Python 3.11+，只用标准库",
+    "commands": {
+      "serve": "python -m anon_proxy serve -c config.toml [--ask-keys]",
+      "keygen": "python -m anon_proxy keygen <别名>",
+      "mask": "python -m anon_proxy mask [-c config.toml] <文本>",
+      "tests": "python -m unittest discover -s tests"
+    },
+    "routes": {
+      "openai": ["POST /v1/responses", "POST /v1/responses/compact", "POST /v1/chat/completions", "GET /v1/models"],
+      "anthropic": ["POST /v1/messages", "POST /v1/messages/count_tokens"],
+      "other": ["GET /health"]
+    }
+  },
+  "context": {
+    "goal": "隐私：上游既不应知道下游用户是谁，也不应看到敏感字符串。走商业按量付费 API key，不共用任何订阅。",
+    "motivation": "担心上游服务商留存或采样用户数据。",
+    "test_environment": {
+      "os": "Windows 11",
+      "python": "3.14.6",
+      "codex_cli": "0.170.0",
+      "claude_code": "2.1.312"
+    },
+    "test_rules": [
+      "不用本机的 ChatGPT / Claude 订阅登录做任何测试",
+      "Codex / Claude Code 测试使用隔离的 CODEX_HOME / CLAUDE_CONFIG_DIR，并设 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+      "真实 Anthropic key 放在 key.txt（已写进 .gitignore），网关每次请求现读，从不打印",
+      "每个发往上游的请求都存进 audit/（脱敏后、key 已隐去），用来核对上游实际看到的内容"
+    ]
+  },
+  "automated_tests": {
+    "command": "python -m unittest discover -s tests",
+    "result": "29 passed",
+    "notes": "运行时会打印几条 ResourceWarning（测试里未关闭的 socket 和 HTTPError 对象），不影响结果",
+    "suites": {
+      "tests/test_masking.py": {
+        "count": 20,
+        "cases": [
+          "test_emails",
+          "test_git_remotes",
+          "test_ips",
+          "test_json_escaped_windows_path",
+          "test_literals",
+          "test_long_username_glued_to_text_is_masked_short_one_is_not_overmatched",
+          "test_masking_is_frozen_once_a_string_was_sent",
+          "test_masking_is_idempotent",
+          "test_no_catastrophic_backtracking",
+          "test_private_key_restores_inside_json_arguments",
+          "test_secret_assignments_but_not_code",
+          "test_secret_tokens",
+          "test_shared_and_placeholder_homes_untouched",
+          "test_stream_restorer_any_split",
+          "test_stream_restorer_json_context",
+          "test_surrogates_stable_per_user_and_differ_across_users",
+          "test_timezone_normalized",
+          "test_unix_wsl_and_spaced_paths",
+          "test_username_seen_before_its_path_is_still_masked",
+          "test_windows_home_username_is_learned_everywhere"
+        ]
+      },
+      "tests/test_e2e.py": {
+        "count": 9,
+        "cases": [
+          "test_audit_files_match_what_upstream_saw",
+          "test_chat_completions_stream_and_plain",
+          "test_claude_code_messages_stream",
+          "test_codex_responses_stream_is_scrubbed_and_restored",
+          "test_codex_tool_call_round_trip",
+          "test_history_prefix_stays_byte_identical",
+          "test_tool_result_turn",
+          "test_unknown_key_is_rejected_before_upstream",
+          "test_users_get_different_surrogates"
+        ]
+      }
+    }
+  },
+  "fake_upstream_tests": {
+    "setup": "真实客户端 → 网关 → tests/fake_upstream.py（假上游，把收到的每个请求记进 JSONL）",
+    "codex_cli_0.170.0": [
+      "/v1/responses 流式请求：请求头从零重建；client_metadata（含 installation_id）和会话/轮次 ID 被删除；prompt_cache_key 换成伪名；客户端生成的消息 ID 换成伪 UUID；时区改成 UTC；强制 store=false",
+      "工具调用参数在客户端执行前已还原；命令被 codex 的只读沙箱拦下，返回给上游的输出同样经过脱敏"
+    ],
+    "claude_code_2.1.312": [
+      "/v1/messages 流式请求：metadata.user_id（含 device_id）、billing header、X-Claude-Code-Session-Id、X-Stainless-*、x-app 都没有发给上游",
+      "Claude Code 实际执行了还原后的 echo 命令"
+    ],
+    "leaks": 0
+  },
+  "performance": {
+    "redos_fix": "60KB 的对抗输入（a.a.a… / a-a-a…）原先单条正则要 146–150 秒；给量词加上界并加关键词预筛之后，最坏情况每条正则不到 0.17 秒。test_no_catastrophic_backtracking 是回归测试。"
+  },
+  "real_api_tests": {
+    "date": "2026-11-24",
+    "anthropic": {
+      "model": "claude-opus-5-5",
+      "key": {
+        "source": "key.txt（配置项 api_key_file）",
+        "prefix": "sk-ant-usr-（公开文档里查不到这种前缀）"
+      },
+      "steps": [
+        {
+          "id": 1,
+          "what": "Claude Code（claude -p）经网关，默认配置 strip_billing_header = true",
+          "result": "400：Credit balance is too low（两次）"
+        },
+        {
+          "id": 2,
+          "what": "把完整的、脱敏后的 Claude Code 请求重放到 count_tokens 接口（不计费）",
+          "result": "200，input_tokens = 18058。真实 API 接受网关改写后的请求格式，包括注入的 block_binding 和 thinking-binding beta"
+        },
+        {
+          "id": 3,
+          "what": "同一个 key 直连发最小请求",
+          "result": "200；改用 Claude Code 的 max_tokens = 128000 加 adaptive thinking 也是 200，说明账户有余额"
+        },
+        {
+          "id": 4,
+          "what": "直连，最小请求每次只加一样 Claude Code 的东西",
+          "result": {
+            "claude-cli/2.1.312 的 User-Agent": "400 credit balance too low",
+            "全部 9 个 Claude Code beta": "400",
+            "只加 claude-code-20250219 beta": "400",
+            "Claude Code 的系统提示词": "400",
+            "thinking / context_management / output_config / max_tokens（beta 里去掉 claude-code）": "200",
+            "stream": "200",
+            "Claude Code 的 14 个工具定义（beta 里去掉 claude-code）": "200",
+            "完整请求原样重放": "400"
+          },
+          "note": "被拒的请求没有生成内容，不产生用量"
+        },
+        {
+          "id": 5,
+          "what": "测试配置改成 strip_billing_header = false（原样转发 Claude Code 自己的 x-anthropic-billing-header，claude -p 写的是 cc_entrypoint=sdk-cli），claude -p 经网关",
+          "result": "2 个请求都是 200；上游零泄露；工具调用参数和最终回答都已还原"
+        },
+        {
+          "id": 6,
+          "what": "同上，换成需要推理的提示词",
+          "result": "2 个请求都是 200；第二个请求回传了带签名的 thinking 块（display = omitted，签名 1416 字符）；零泄露；网关日志里没有 thinking_dropped"
+        },
+        {
+          "id": 7,
+          "what": "把第 6 步的第二个请求改成 prefix_mismatch_behavior = \"error\"，直连原样重放",
+          "result": "200；input_transformations 为空，没有丢弃任何 thinking 块；cache_read_input_tokens = 18519，提示缓存命中"
+        }
+      ],
+      "leak_check": {
+        "method": "在 audit/ 里搜索测试提示词中的原文：邮箱、邮箱域名、本机用户名、内网 IP",
+        "requests_checked": 4,
+        "leaks": 0
+      },
+      "tool_call_restore_example": {
+        "upstream_saw": "echo \"252 C:/Users/user4105f3d1/work\"",
+        "executed_locally": "echo \"252 C:/Users/<local-user>/work\""
+      },
+      "final_answer": "回答里的邮箱、项目路径和数据库 IP 都换回了原文",
+      "gateway_log_masked_counts": ["email=1, ip=1, user=2", "email=1, ip=1, user=4"],
+      "approx_cost_usd": "所有真实调用合计估计不到 0.3"
+    },
+    "openai": {
+      "result": "未测试",
+      "reason": "测试机上没有 OpenAI API key"
+    }
+  },
+  "findings": [
+    {
+      "title": "Anthropic 从请求本身认出 Claude Code",
+      "detail": "claude-cli 的 User-Agent、claude-code-20250219 beta、Claude Code 的系统提示词，任意一项就足以让请求被当成 Claude Code（实测）。这和 README 里“客户端类型对上游可见”的限制一致。"
+    },
+    {
+      "title": "订阅附带的月度 API 额度不覆盖 Claude Code",
+      "detail": "Max / Team / Ultra 订阅附带的月度 API 额度可以用于普通 API 调用和 Agent SDK，不能用于交互式 Claude Code；claude -p 只有在本人用关联组织的 key 运行时才算。Anthropic 靠 billing header 里的 cc_entrypoint 认出 claude -p。网关默认删掉这一段，所以 claude -p 也被拒；设 strip_billing_header = false 后通过。"
+    },
+    {
+      "title": "thinking 历史校验在真实 API 上兼容",
+      "detail": "脱敏结果冻结让历史前缀逐字节不变；严格模式（error）重放通过，没有丢弃 thinking 块。"
+    },
+    {
+      "title": "提示缓存照常命中",
+      "detail": "同一会话里脱敏结果稳定，第二轮请求命中 18519 个缓存 token。"
+    }
+  ],
+  "config_state": {
+    "strip_billing_header": "默认 true。只有订阅附带额度、又要跑 claude -p 时才需要改成 false，代价是上游能看到 Claude Code 版本号和启动方式。",
+    "end_user_id": "默认 \"none\"。多人使用时可改成 \"pseudonym\"，上游能针对单个下游用户处置，而不是处罚整个账户。"
+  },
+  "decisions": [
+    "网关不会把 Claude Code 请求伪装成普通 API 调用来使用订阅附带的额度",
+    "网关只用 API key 转发，不使用 ChatGPT / Claude 订阅登录"
+  ],
+  "open_items": [
+    "OpenAI 真实上游未测（没有 OpenAI API key），Codex 经网关走真实 API 还没验证",
+    "upstream_proxy（HTTP CONNECT 隧道）路径未测",
+    "交互式 Claude Code 经网关：只有订阅附带额度的账户会被拒，需要另购 Console 额度后再测",
+    "测试运行时的 ResourceWarning（未关闭的 socket）可以顺手清理"
+  ],
+  "policy_context": {
+    "checked_at": "2026-11-24",
+    "disclaimer": "按条款原文的理解，不是法律意见；几份条款都没写清楚“中转 / 网关”的情况",
+    "points": [
+      "Anthropic Credit Terms B.2：额度只能由账户持有人使用，不得转让或出售。订阅附带的额度不能拿来服务别人，换成什么客户端都一样。",
+      "Anthropic Commercial Terms：可以用 API 给自己的用户提供产品（A.1），未经批准不得转售（D.4），账户下的一切由客户负责（D.5）。",
+      "OpenAI Usage Policies（2026-11-20 生效）：让第三方直接访问 OpenAI 模型的中转服务需事先经 OpenAI 审批；这个网关转发别人的 Codex 请求，很可能属于这一类。",
+      "OpenAI Services Agreement：可以向终端用户提供服务，但禁止多人共用账户凭据、转售或出租账户访问（§3.1），禁止买卖或转让 API key（§3.3(g)），禁止让不支持地区的人经由你访问（§16.12）。",
+      "OpenAI Terms of Use：不得把 ChatGPT 账户给别人使用，所以不能用 ChatGPT 登录转发别人的 Codex 请求。"
+    ],
+    "sources": [
+      "https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-and-team-plans",
+      "https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers",
+      "https://www.anthropic.com/legal/credit-terms",
+      "https://www.anthropic.com/legal/commercial-terms",
+      "https://openai.com/policies/usage-policies/",
+      "https://openai.com/policies/services-agreement/",
+      "https://openai.com/policies/terms-of-use/"
+    ]
+  }
+}
