@@ -16,7 +16,6 @@ import ssl
 import sys
 import threading
 import time
-import tomllib
 import urllib.parse
 import zlib
 from dataclasses import dataclass, field
@@ -27,12 +26,15 @@ try:  # Python 3.14+
 except ImportError:  # pragma: no cover
     zstd = None
 
+from ._toml import load_toml_bytes
+from .bridge import (BridgeMeta, ProviderConfig, bridge_stream_restorer, convert_anthropic_json,
+                     to_canonical_anthropic, translate_anthropic_error)
 from .masking import MaskConfig, Masker, RestoreDict, Vault, restore_tree
 from .protocols import (Privacy, RequestContext, note_thinking_drops, scrub_anthropic, scrub_openai,
                         stream_restorer)
 
 DEFAULT_OPENAI_UA = "codex_cli_rs/0.170.0 (Windows 10.0.26200; x86_64) WindowsTerminal"
-DEFAULT_ANTHROPIC_UA = "claude-cli/2.1.312 (external, cli)"
+DEFAULT_ANTHROPIC_UA = "Anthropic/Python 0.52.0"
 DEFAULT_KEEP = ("git@github.com", "noreply@github.com", "noreply@anthropic.com", "8.8.8.8", "8.8.4.4",
                 "1.1.1.1", "1.0.0.1")
 PASS_RESPONSE_HEADERS = frozenset({"x-request-id", "request-id", "retry-after", "openai-processing-ms"})
@@ -52,30 +54,61 @@ class Upstream:
     api_key_file: str | None = None   # read on every request, so it can be created or replaced while running
 
 
-def upstream_key(up: Upstream) -> str:
-    """Environment variable first, then the key file (first non-empty line; NAME=value also accepted)."""
-    key = os.environ.get(up.api_key_env, "").strip()
-    if key or not up.api_key_file:
-        return key
+def _parse_env_file(path: str) -> dict[str, str]:
+    out: dict[str, str] = {}
     try:
-        with open(up.api_key_file, encoding="utf-8-sig") as f:
-            lines = [line.strip() for line in f if line.strip()]
+        with open(path, encoding="utf-8-sig") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                        v = v[1:-1]
+                    elif " #" in v:
+                        v = v.split(" #", 1)[0].strip()
+                    out[k] = v
     except OSError:
-        return ""
-    if not lines:
-        return ""
-    key = lines[0]
-    if re.match(r"^[A-Z_][A-Z0-9_]*\s*=", key):
-        key = key.split("=", 1)[1].strip()
-    return key.strip("\"'")
+        pass
+    return out
+
+
+def upstream_key(up: Upstream) -> str:
+    """Environment variable first, then api_key_file / .env (re-read on every request)."""
+    key = os.environ.get(up.api_key_env, "").strip()
+    if key:
+        return key
+    candidates = [up.api_key_file] if up.api_key_file else []
+    if ".env" not in [os.path.basename(p) for p in candidates if p]:
+        base = os.path.dirname(up.api_key_file) if up.api_key_file else os.getcwd()
+        candidates.append(os.path.join(base, ".env"))
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        kv = _parse_env_file(path)
+        if kv.get(up.api_key_env):
+            return kv[up.api_key_env]
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+        except OSError:
+            continue
+        if len(lines) == 1 and "=" not in lines[0]:
+            return lines[0].strip("\"'")
+    return ""
 
 
 def key_status(up: Upstream) -> str:
     if os.environ.get(up.api_key_env, "").strip():
         return f"from ${up.api_key_env}"
-    if up.api_key_file and upstream_key(up):
-        return f"from file {up.api_key_file}"
-    where = f"${up.api_key_env}" + (f" or {up.api_key_file}" if up.api_key_file else "")
+    if upstream_key(up):
+        return f"from {up.api_key_file or '.env'}"
+    where = f"${up.api_key_env}" + (f" or {up.api_key_file}" if up.api_key_file else " or .env")
     return f"NOT SET ({where})"
 
 
@@ -87,6 +120,7 @@ class Settings:
         "https://api.openai.com/v1", "OPENAI_API_KEY", DEFAULT_OPENAI_UA))
     anthropic: Upstream = field(default_factory=lambda: Upstream(
         "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", DEFAULT_ANTHROPIC_UA))
+    provider: ProviderConfig = field(default_factory=ProviderConfig)
     upstream_proxy: str | None = None
     timeout: float = 900.0
     users: dict[str, str] = field(default_factory=dict)
@@ -94,6 +128,7 @@ class Settings:
     mask: MaskConfig = field(default_factory=lambda: MaskConfig(keep=frozenset(DEFAULT_KEEP)))
     secret: bytes = b""
     audit_dir: str | None = None
+    vault_dir: str | None = None
 
 
 def _upstream(raw: dict, default: Upstream, base_dir: str) -> Upstream:
@@ -130,7 +165,7 @@ def _load_secret(secret_file: str, base_dir: str) -> bytes:
 
 def load_settings(path: str) -> Settings:
     with open(path, "rb") as f:
-        data = tomllib.load(f)
+        data = load_toml_bytes(f.read())
     base = os.path.dirname(os.path.abspath(path))
     s = Settings()
     host, _, port = str(data.get("listen", "127.0.0.1:8787")).rpartition(":")
@@ -138,6 +173,23 @@ def load_settings(path: str) -> Settings:
     ups = data.get("upstream") or {}
     s.openai = _upstream(ups.get("openai") or {}, s.openai, base)
     s.anthropic = _upstream(ups.get("anthropic") or {}, s.anthropic, base)
+    dotenv = _parse_env_file(os.path.join(base, ".env"))
+    pr = data.get("provider") or {}
+    default_model = dotenv.get("ANTHROPIC_MODEL") or str(pr.get("default_model", "claude-sonnet-4-20250514"))
+    s.provider = ProviderConfig(
+        target=str(pr.get("target", "")).strip().lower(),
+        default_model=default_model,
+        force_model=bool(pr.get("force_model", False)),
+        model_map={str(k): str(v) for k, v in (pr.get("model_map") or {}).items()},
+        default_max_tokens=int(pr.get("default_max_tokens", 16384)),
+        thinking_mode=str(pr.get("thinking_mode", "auto")),
+        strip_client_betas=bool(pr.get("strip_client_betas", True)),
+        sanitize_system=bool(pr.get("sanitize_system", True)),
+    )
+    if s.provider.target not in ("", "anthropic"):
+        raise ValueError('provider.target must be "" or "anthropic"')
+    if s.provider.thinking_mode not in ("auto", "adaptive", "off"):
+        raise ValueError('provider.thinking_mode must be "auto", "adaptive" or "off"')
     net = data.get("network") or {}
     s.upstream_proxy = net.get("upstream_proxy") or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     s.timeout = float(net.get("timeout_seconds", 900))
@@ -145,31 +197,44 @@ def load_settings(path: str) -> Settings:
     s.privacy = Privacy(end_user_id=str(pv.get("end_user_id", "none")),
                         force_store_false=bool(pv.get("force_store_false", True)),
                         strip_billing_header=bool(pv.get("strip_billing_header", True)),
+                        strip_silent_git=bool(pv.get("strip_silent_git", True)),
                         thinking_mismatch=str(pv.get("thinking_mismatch", "drop_block")))
     if s.privacy.end_user_id not in ("none", "pseudonym"):
         raise ValueError('privacy.end_user_id must be "none" or "pseudonym"')
     if s.privacy.thinking_mismatch not in ("drop_block", "error", "off"):
         raise ValueError('privacy.thinking_mismatch must be "drop_block", "error" or "off"')
     mk = data.get("masking") or {}
+    style = str(mk.get("surrogate_style", "tagged"))
+    if style not in ("tagged", "natural"):
+        raise ValueError('masking.surrogate_style must be "tagged" or "natural"')
     s.mask = MaskConfig(
-        secrets=bool(mk.get("secrets", True)), emails=bool(mk.get("emails", True)),
-        ips=bool(mk.get("ips", True)), path_usernames=bool(mk.get("path_usernames", True)),
-        hostnames=bool(mk.get("hostnames", True)), git_remotes=bool(mk.get("git_remotes", True)),
+        secrets=bool(mk.get("secrets", True)),
+        entropy_secrets=bool(mk.get("entropy_secrets", False)),
+        emails=bool(mk.get("emails", True)),
+        ips=bool(mk.get("ips", True)),
+        path_usernames=bool(mk.get("path_usernames", True)),
+        mask_cwd=bool(mk.get("mask_cwd", False)),
+        normalize_os_version=bool(mk.get("normalize_os_version", True)),
+        hostnames=bool(mk.get("hostnames", True)),
+        git_remotes=bool(mk.get("git_remotes", True)),
         literals=tuple(str(x) for x in mk.get("literals", [])),
         keep=frozenset(str(x) for x in mk.get("keep", DEFAULT_KEEP)),
         timezone=str(pv.get("timezone", "UTC")) or None,
+        surrogate_style=style,
     )
     s.users = {str(k): str(v) for k, v in (data.get("users") or {}).items()}
     s.secret = _load_secret(str(pv.get("secret_file", "data/secret.key")), base)
     audit = str(pv.get("audit_dir", "") or "")
     s.audit_dir = (audit if os.path.isabs(audit) else os.path.join(base, audit)) if audit else None
+    vdir = str(pv.get("vault_dir", "") or "")
+    s.vault_dir = (vdir if os.path.isabs(vdir) else os.path.join(base, vdir)) if vdir else None
     return s
 
 
 # ------------------------------------------------------------------ helpers
 
 def route(path: str, headers) -> tuple[str, str] | None:
-    """-> (provider, endpoint-after-/v1) or None."""
+    """-> (downstream-dialect-provider, endpoint-after-/v1) or None."""
     p = path.rstrip("/") or "/"
     rest = p[3:] if p.startswith("/v1/") else p
     if rest == "/responses" or rest.startswith("/responses/") or rest in (
@@ -196,7 +261,7 @@ def decode_body(raw: bytes, encoding: str | None) -> bytes:
 
 
 def upstream_headers(provider: str, up: Upstream, key: str, client_headers, stream: bool,
-                     data: bytes | None, extra_betas=()) -> dict[str, str]:
+                     data: bytes | None, extra_betas=(), *, ignore_client_headers: bool = False) -> dict[str, str]:
     """Built from scratch: nothing the client sent is forwarded except what the API needs."""
     h = {"User-Agent": up.user_agent, "Accept": "text/event-stream" if stream else "application/json",
          "Accept-Encoding": "identity"}
@@ -205,9 +270,10 @@ def upstream_headers(provider: str, up: Upstream, key: str, client_headers, stre
         h["Content-Length"] = str(len(data))
     if provider == "anthropic":
         h["x-api-key"] = key
-        h["anthropic-version"] = client_headers.get("anthropic-version") or "2023-06-01"
-        # feature flags the request body relies on, plus any the proxy itself needs
-        betas = [b.strip() for b in (client_headers.get("anthropic-beta") or "").split(",") if b.strip()]
+        h["anthropic-version"] = "2023-06-01" if ignore_client_headers \
+            else (client_headers.get("anthropic-version") or "2023-06-01")
+        betas = [] if ignore_client_headers else [
+            b.strip() for b in (client_headers.get("anthropic-beta") or "").split(",") if b.strip()]
         betas += [b for b in extra_betas if b not in betas]
         if betas:
             h["anthropic-beta"] = ",".join(betas)
@@ -251,6 +317,19 @@ def format_sse(name, data) -> bytes:
     return (head + "".join(f"data: {line}\n" for line in payload.split("\n")) + "\n").encode()
 
 
+def _normalize_models_for_openai(parsed: dict) -> dict:
+    items = []
+    for m in parsed.get("data") or []:
+        if isinstance(m, dict) and m.get("id"):
+            items.append({
+                "id": m["id"],
+                "object": "model",
+                "created": int(m.get("created") or 0),
+                "owned_by": str(m.get("owned_by") or "anthropic"),
+            })
+    return {"object": "list", "data": items}
+
+
 # ------------------------------------------------------------------ proxy core
 
 class Proxy:
@@ -263,13 +342,19 @@ class Proxy:
         self._seq = itertools.count(1)
         if settings.audit_dir:
             os.makedirs(settings.audit_dir, exist_ok=True)
+        if settings.vault_dir:
+            os.makedirs(settings.vault_dir, exist_ok=True)
 
     def vault(self, user: str) -> Vault:
         with self._lock:
             v = self._vaults.get(user)
             if v is None:
                 key = hmac.new(self.s.secret, b"vault\x00" + user.encode(), hashlib.sha256).digest()
-                v = self._vaults[user] = Vault(key)
+                persist = None
+                if self.s.vault_dir:
+                    safe_user = re.sub(r"[^\w.-]", "_", user)
+                    persist = os.path.join(self.s.vault_dir, f"{safe_user}.vault")
+                v = self._vaults[user] = Vault(key, style=self.s.mask.surrogate_style, persist_path=persist)
             return v
 
     def authenticate(self, key: str) -> str | None:
@@ -363,11 +448,12 @@ def make_handler(proxy: Proxy):
             key = key or (self.headers.get("x-api-key") or "").strip()
             return proxy.authenticate(key) if key else None
 
-        def _log(self, user, path, status, t0, ctx) -> None:
+        def _log(self, user, path, status, t0, ctx, bridged: str = "") -> None:
             stats = ",".join(f"{k}={v}" for k, v in sorted(ctx.stats.items())) if ctx and ctx.stats else "-"
             notes = f" thinking_dropped={ctx.notes['thinking_dropped']}" \
                 if ctx and ctx.notes.get("thinking_dropped") else ""
-            print(f"{time.strftime('%H:%M:%S')} {user} {self.command} {path} -> {status} "
+            via = f" [{bridged}]" if bridged else ""
+            print(f"{time.strftime('%H:%M:%S')} {user} {self.command} {path}{via} -> {status} "
                   f"{time.monotonic() - t0:.1f}s masked[{stats}]{notes}", file=sys.stderr, flush=True)
 
         # -- verbs
@@ -378,10 +464,15 @@ def make_handler(proxy: Proxy):
             r = route(path, self.headers)
             if r is None:
                 return self._error(404, f"unknown endpoint {path}")
+            client_prov, endpoint = r
             user = self._user()
             if user is None:
-                return self._error(401, "missing or unknown gateway key", r[0])
-            self._forward(r[0], r[1], user, None, None)
+                return self._error(401, "missing or unknown gateway key", client_prov)
+            if proxy.s.provider.target == "anthropic":
+                self._forward("anthropic", endpoint, user, None, None,
+                              client_provider=client_prov, normalize_models=(client_prov == "openai"))
+            else:
+                self._forward(client_prov, endpoint, user, None, None, client_provider=client_prov)
 
         def do_POST(self):
             t0 = time.monotonic()
@@ -389,31 +480,51 @@ def make_handler(proxy: Proxy):
             r = route(path, self.headers)
             if r is None:
                 return self._error(404, f"unknown endpoint {path}")
-            provider, endpoint = r
+            client_prov, endpoint = r
             user = self._user()
             if user is None:
-                return self._error(401, "missing or unknown gateway key", provider)
+                return self._error(401, "missing or unknown gateway key", client_prov)
             try:
                 body = json.loads(decode_body(self._read_body(), self.headers.get("Content-Encoding")))
                 if not isinstance(body, dict):
                     raise ValueError("not an object")
             except Exception:
-                return self._error(400, "request body must be a JSON object", provider)
-            ctx = RequestContext(user, proxy.vault(user), proxy.masker, proxy.s.privacy, proxy.s.secret)
-            (scrub_anthropic if provider == "anthropic" else scrub_openai)(endpoint, body, ctx)
-            status = self._forward(provider, endpoint + (f"?{query}" if query else ""), user, body, ctx)
-            self._log(user, path, status, t0, ctx)
+                return self._error(400, "request body must be a JSON object", client_prov)
+
+            v = proxy.vault(user)
+            ctx = RequestContext(user, v, proxy.masker, proxy.s.privacy, proxy.s.secret)
+            try:
+                if proxy.s.provider.target == "anthropic":
+                    if endpoint == "/embeddings":
+                        return self._error(400, "embeddings endpoint is not supported on Anthropic target", client_prov)
+                    target_ep, out_body, bmeta = to_canonical_anthropic(
+                        client_prov, endpoint, body, ctx, proxy.s.provider)
+                    ignore_hdrs = proxy.s.provider.strip_client_betas or client_prov != "anthropic"
+                    status = self._forward("anthropic", target_ep, user, out_body, ctx,
+                                           client_provider=client_prov, bridge_meta=bmeta,
+                                           ignore_client_headers=ignore_hdrs)
+                    self._log(user, path, status, t0, ctx, f"->anthropic:{bmeta.upstream_model}")
+                else:
+                    (scrub_anthropic if client_prov == "anthropic" else scrub_openai)(endpoint, body, ctx)
+                    status = self._forward(client_prov, endpoint + (f"?{query}" if query else ""), user, body, ctx,
+                                           client_provider=client_prov)
+                    self._log(user, path, status, t0, ctx)
+            finally:
+                v.flush_disk()
 
         # -- forwarding
-        def _forward(self, provider: str, endpoint_qs: str, user: str, body, ctx) -> int:
+        def _forward(self, provider: str, endpoint_qs: str, user: str, body, ctx, *,
+                     client_provider: str | None = None, bridge_meta: BridgeMeta | None = None,
+                     ignore_client_headers: bool = False, normalize_models: bool = False) -> int:
+            err_prov = client_provider or provider
             up = proxy.s.anthropic if provider == "anthropic" else proxy.s.openai
             key = upstream_key(up)
             if not key:
-                self._error(500, f"upstream API key missing: {key_status(up)}", provider)
+                self._error(500, f"upstream API key missing: {key_status(up)}", err_prov)
                 return 500
             data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode() if body is not None else None
             headers = upstream_headers(provider, up, key, self.headers, bool(body and body.get("stream")), data,
-                                       ctx.extra_betas if ctx else ())
+                                       ctx.extra_betas if ctx else (), ignore_client_headers=ignore_client_headers)
             conn, base_path = proxy.connect(up)
             target = base_path + endpoint_qs
             origin = urllib.parse.urlsplit(up.base_url)
@@ -423,11 +534,13 @@ def make_handler(proxy: Proxy):
                 resp = conn.getresponse()
             except (OSError, http.client.HTTPException) as e:
                 conn.close()
-                self._error(502, f"upstream unreachable: {e.__class__.__name__}: {e}", provider)
+                self._error(502, f"upstream unreachable: {e.__class__.__name__}: {e}", err_prov)
                 return 502
-            return self._relay(provider, endpoint_qs.split("?", 1)[0], resp, conn, ctx)
+            return self._relay(provider, endpoint_qs.split("?", 1)[0], resp, conn, ctx,
+                               bridge_meta=bridge_meta, normalize_models=normalize_models)
 
-        def _relay(self, provider: str, endpoint: str, resp, conn, ctx) -> int:
+        def _relay(self, provider: str, endpoint: str, resp, conn, ctx, *,
+                   bridge_meta: BridgeMeta | None = None, normalize_models: bool = False) -> int:
             if ctx is not None:
                 plain, js = ctx.restore_dicts()
             else:
@@ -445,7 +558,11 @@ def make_handler(proxy: Proxy):
                     self.send_header("Connection", "close")
                     self.end_headers()
                     self.close_connection = True
-                    restorer = stream_restorer(provider, endpoint, plain, js, ctx.notes if ctx else None)
+                    if bridge_meta is not None:
+                        restorer = bridge_stream_restorer(
+                            bridge_meta, plain, js, proxy.s.secret, ctx.notes if ctx else None)
+                    else:
+                        restorer = stream_restorer(provider, endpoint, plain, js, ctx.notes if ctx else None)
                     for name, raw in iter_sse(resp):
                         if name == COMMENT:
                             self.wfile.write(format_sse(COMMENT, raw))
@@ -465,9 +582,20 @@ def make_handler(proxy: Proxy):
                 if "json" in ctype:
                     try:
                         parsed = json.loads(raw)
-                        if ctx is not None and isinstance(parsed, dict):
-                            note_thinking_drops(parsed, ctx.notes)
-                        raw = json.dumps(restore_tree(parsed, plain, js), ensure_ascii=False).encode()
+                        if isinstance(parsed, dict):
+                            if bridge_meta is not None:
+                                if resp.status < 400:
+                                    parsed = convert_anthropic_json(
+                                        parsed, plain, js, bridge_meta, proxy.s.secret, ctx.notes if ctx else None)
+                                else:
+                                    parsed = translate_anthropic_error(restore_tree(parsed, plain, js), bridge_meta)
+                            elif normalize_models and resp.status < 400:
+                                parsed = _normalize_models_for_openai(parsed)
+                            else:
+                                if ctx is not None:
+                                    note_thinking_drops(parsed, ctx.notes)
+                                parsed = restore_tree(parsed, plain, js)
+                            raw = json.dumps(parsed, ensure_ascii=False).encode()
                     except ValueError:
                         pass
                 self.send_response(resp.status)
@@ -504,11 +632,17 @@ def build_server(settings: Settings) -> ThreadingHTTPServer:
 def serve(settings: Settings) -> None:
     server = build_server(settings)
     print(f"anon-proxy listening on http://{settings.host}:{server.server_address[1]}", file=sys.stderr)
-    print(f"  openai    -> {settings.openai.base_url}  key {key_status(settings.openai)}", file=sys.stderr)
-    print(f"  anthropic -> {settings.anthropic.base_url}  key {key_status(settings.anthropic)}", file=sys.stderr)
+    if settings.provider.target == "anthropic":
+        print(f"  mode      -> virtual provider (all endpoints unified to Anthropic {settings.provider.default_model})",
+              file=sys.stderr)
+        print(f"  anthropic -> {settings.anthropic.base_url}  key {key_status(settings.anthropic)}", file=sys.stderr)
+    else:
+        print(f"  openai    -> {settings.openai.base_url}  key {key_status(settings.openai)}", file=sys.stderr)
+        print(f"  anthropic -> {settings.anthropic.base_url}  key {key_status(settings.anthropic)}", file=sys.stderr)
     print(f"  users: {len(settings.users)}  end_user_id: {settings.privacy.end_user_id}  "
-          f"thinking_mismatch: {settings.privacy.thinking_mismatch}  "
-          f"audit: {settings.audit_dir or 'off'}  upstream proxy: {settings.upstream_proxy or 'none'}",
+          f"surrogates: {settings.mask.surrogate_style}  thinking_mismatch: {settings.privacy.thinking_mismatch}  "
+          f"vaults: {settings.vault_dir or 'memory'}  audit: {settings.audit_dir or 'off'}  "
+          f"upstream proxy: {settings.upstream_proxy or 'none'}",
           file=sys.stderr)
     if not settings.users:
         print("  WARNING: no [users] configured, every request will get 401", file=sys.stderr)

@@ -1,8 +1,8 @@
 # anon-proxy
 
-一个放在 Codex CLI / Claude Code 和官方付费 API 之间的脱敏网关。下游用户的请求先进网关：身份标识被删掉或换成不可逆伪名，正文里的敏感字符串换成替身，然后用**你自己的商业 API key** 转发给 OpenAI / Anthropic。回复回来时再把替身换回原文（流式输出和工具调用参数里也会换），客户端照常工作。
+一个放在 Codex CLI / 各类开源客户端 / Claude Code 和官方商业 API 之间的虚拟 Provider 脱敏网关。下游客户端把网关当成自己的模型服务商：身份标识被删掉或换成不可逆伪名，正文里的敏感字符串换成拟真替身，并且可**把不同客户端的协议统一洗成同一种标准的 Anthropic `/v1/messages` 请求**用你自己的商业 API key 转发给 Claude。回复回来时再把替身换回原文、并实时合成为下游客户端原生的流式事件（流式输出和工具调用参数里也会换），客户端无感工作。
 
-纯 Python 标准库实现，Python 3.11+，不需要安装任何依赖。
+纯 Python 标准库实现，兼容 Python 3.9+（无需安装任何第三方依赖）。
 
 ## 上游还能看到什么
 
@@ -39,21 +39,25 @@ python -m anon_proxy serve -c config.toml
 
 要让别人连进来，把 `listen` 改成 `0.0.0.0:8787`，并在前面加一层 HTTPS 反向代理（Caddy / nginx）。网关 key 是明文放在请求头里的，直接走公网 HTTP 等于把 key 送人。
 
-### 下游 Codex
+### 下游 Codex（把网关当作虚拟 Provider 调 Claude）
+
+当 `config.toml` 里开启默认的 `[provider] target = "anthropic"` 时，Codex 发来的 `/v1/responses`（含 `/v1/responses/compact`、`apply_patch` 自定义补丁工具、多轮推理）会被网关自动洗成纯净的 Claude `/v1/messages` 请求，回包再合成为 Responses SSE 流；Claude 的签名 `thinking` 块也会借道 Codex 的 `reasoning.encrypted_content` 实现无状态逐字节回传。
 
 `~/.codex/config.toml`：
 
 ```toml
+model = "claude-opus-5-5"
 model_provider = "anon"
 
 [model_providers.anon]
 name = "anon proxy"
-base_url = "https://你的网关/v1"
+base_url = "http://127.0.0.1:8787/v1"
 env_key = "ANON_PROXY_KEY"
 wire_api = "responses"
+requires_openai_auth = false
 ```
 
-然后设置 `ANON_PROXY_KEY` 为分给他的 `gk-...`。自定义 provider 走 HTTP SSE，网关支持 `/v1/responses`（含 `/responses/compact`）、`/v1/chat/completions`。
+然后设置 `ANON_PROXY_KEY` 为分给他的 `gk-...`。除了 Codex，任何支持 `/v1/chat/completions` 的开源客户端或 `/v1/messages` 客户端连进来，都会被统一归一化为相同结构的标准 Claude 请求。若想退回原协议直通模式（OpenAI 转 OpenAI、Anthropic 转 Anthropic），把 `provider.target` 设成 `""` 即可。
 
 ### 下游 Claude Code
 
@@ -68,7 +72,8 @@ $env:ANTHROPIC_API_KEY = "gk-..."
 
 Claude Opus 5.5、Fable 5.x 会校验回传的 thinking 块：它之前的 system、工具和消息必须和生成时逐字节一致，否则直接返回 400（2026-08-31 以后注册的账号默认强制，Fable 5.2 对所有账号强制）。网关为此做了两件事：
 
-- **脱敏结果冻结**：一段文字第一次脱敏后，结果按原文缓存，之后每轮都原样复用。即使后面学到了新用户名，也不会回头改动早先的轮次。早先那段文字当时已经发出去了，再改它并不能补救隐私，只会让历史对不上。
+- **脱敏结果冻结与加密持久化**：一段文字第一次脱敏后，结果按原文缓存，之后每轮都原样复用。配置 `vault_dir = "data/vaults"` 后，替身映射与冻结缓存会用 `secret.key` 派生密钥加密落盘，即使网关重启也不会让进行中的会话丢缓存触发 `thinking_dropped`。
+- **拟真替身与高熵密钥兜底**：`surrogate_style = "natural"` 将用户名、邮箱、仓库、密钥替换成拟真格式（如 `alex_mercer9f2a`、`tok_test_...`），消除显眼的脱敏标记；`entropy_secrets = true` 通过香农熵自动捕获无固定前缀的随机密钥（自动跳过 git SHA 和代码标识符）。
 - **`thinking_mismatch = "drop_block"`**（默认）：对 `thinking.type = "adaptive"` 的请求加上 `block_binding.prefix_mismatch_behavior` 和 `thinking-binding-controls-2026-08-01` beta。万一历史还是变了（比如网关重启后缓存清空、改了 `literals`），API 只丢弃受影响的 thinking 块继续回答，不会整个请求报错。丢了几块会出现在网关日志的 `thinking_dropped=` 里。设成 `"error"` 可以在测试时让问题直接暴露；设成 `"off"` 则不改动请求。
 
 已在真实 API 上验证（Opus 5.5，Claude Code 经网关做一轮带 thinking 的工具调用）：把第二轮请求的 `prefix_mismatch_behavior` 改成 `"error"` 原样重放，返回 200，`input_transformations` 为空，提示缓存也照常命中。

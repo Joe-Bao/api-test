@@ -68,7 +68,9 @@ class EndToEnd(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.proxy.shutdown()
+        cls.proxy.server_close()
         cls.upstream.shutdown()
+        cls.upstream.server_close()
 
     # -- helpers
     def post(self, path, body, headers):
@@ -78,7 +80,10 @@ class EndToEnd(unittest.TestCase):
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            try:
+                return e.code, e.read()
+            finally:
+                e.close()
 
     def upstream_entries(self):
         with open(fake_upstream.LOG_PATH, encoding="utf-8") as f:

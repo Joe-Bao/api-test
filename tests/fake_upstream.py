@@ -220,47 +220,77 @@ def messages_turn(body: dict):
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
         content = m.get("content")
-        results = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_result"] \
-            if isinstance(content, list) else []
-        if results:
-            kind, text = "tool_result", "\n".join(text_of(c.get("content")) for c in results)
+        if isinstance(content, list):
+            tr_texts = []
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "tool_result":
+                    tr_texts.append(text_of(c.get("content")))
+                    kind, text = "tool_result", "\n".join(x for x in tr_texts if x)
+                elif c.get("type") == "text" and c.get("text"):
+                    tr_texts = []
+                    kind, text = "user", text_of(c.get("text"))
         else:
             kind, text = "user", text_of(content)
     tools = [t.get("name") for t in body.get("tools") or [] if isinstance(t, dict)]
+    with_thinking = bool(body.get("thinking")) and "WITH_THINKING" in text
+    if "apply_patch" in tools and "CALL_PATCH:" in text:
+        payload = text.split("CALL_PATCH:", 1)[1].strip().splitlines()[0].strip()
+        return "patch", payload, "apply_patch", with_thinking
     tool = pick_tool(tools)
     action, value = decide(kind, text, tool)
-    return action, value, tool
+    return action, value, tool, with_thinking
 
 
-def messages_events(model: str, action: str, value: str, tool: str | None):
+def messages_events(model: str, action: str, value: str, tool: str | None, with_thinking: bool = False):
     now = int(time.time())
     msg_id = f"msg_fake_{now}"
     usage = {"input_tokens": 12, "output_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
     events = [("message_start", {"type": "message_start", "message": {
         "id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [],
         "stop_reason": None, "stop_sequence": None, "usage": usage}})]
-    if action == "tool":
-        args = tool_arguments(tool, value)
+    blocks = []
+    idx = 0
+    if with_thinking:
+        thought = f"plan for {value}"
+        sig = "sig_fake_opus_55=="
+        tblock = {"type": "thinking", "thinking": thought, "signature": sig}
+        blocks.append(tblock)
+        events.append(("content_block_start", {"type": "content_block_start", "index": idx,
+                                               "content_block": {"type": "thinking", "thinking": "", "signature": ""}}))
+        for p in pieces(thought):
+            events.append(("content_block_delta", {"type": "content_block_delta", "index": idx,
+                                                   "delta": {"type": "thinking_delta", "thinking": p}}))
+        events.append(("content_block_delta", {"type": "content_block_delta", "index": idx,
+                                               "delta": {"type": "signature_delta", "signature": sig}}))
+        events.append(("content_block_stop", {"type": "content_block_stop", "index": idx}))
+        idx += 1
+    if action in ("tool", "patch"):
+        args = {"input": f"*** Begin Patch\n*** Update File: {value}\n*** End Patch"} if action == "patch" \
+            else tool_arguments(tool, value)
         block = {"type": "tool_use", "id": f"toolu_fake_{now}", "name": tool, "input": args}
-        events.append(("content_block_start", {"type": "content_block_start", "index": 0,
+        blocks.append(block)
+        events.append(("content_block_start", {"type": "content_block_start", "index": idx,
                                                "content_block": {**block, "input": {}}}))
         for p in pieces(json.dumps(args, ensure_ascii=False)):
-            events.append(("content_block_delta", {"type": "content_block_delta", "index": 0,
+            events.append(("content_block_delta", {"type": "content_block_delta", "index": idx,
                                                    "delta": {"type": "input_json_delta", "partial_json": p}}))
         stop = "tool_use"
     else:
         block = {"type": "text", "text": value}
-        events.append(("content_block_start", {"type": "content_block_start", "index": 0,
+        blocks.append(block)
+        events.append(("content_block_start", {"type": "content_block_start", "index": idx,
                                                "content_block": {"type": "text", "text": ""}}))
         for p in pieces(value):
-            events.append(("content_block_delta", {"type": "content_block_delta", "index": 0,
+            events.append(("content_block_delta", {"type": "content_block_delta", "index": idx,
                                                    "delta": {"type": "text_delta", "text": p}}))
         stop = "end_turn"
-    events.append(("content_block_stop", {"type": "content_block_stop", "index": 0}))
+    events.append(("content_block_stop", {"type": "content_block_stop", "index": idx}))
     events.append(("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
                                      "usage": {"output_tokens": 4}}))
     events.append(("message_stop", {"type": "message_stop"}))
-    final = {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [block],
+    final = {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": blocks,
              "stop_reason": stop, "stop_sequence": None, "usage": {**usage, "output_tokens": 4}}
     return events, final
 

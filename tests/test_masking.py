@@ -150,6 +150,55 @@ class MaskingTests(unittest.TestCase):
         out, _ = run(m, v, "<timezone>Europe/Berlin</timezone>")
         self.assertEqual(out, "<timezone>UTC</timezone>")
 
+    def test_sydney_timezone_and_date_synced_plus_darwin_var_folders(self):
+        import datetime
+        import zoneinfo
+        cfg = MaskConfig(surrogate_style="natural", timezone="Australia/Sydney")
+        m, v = Masker(cfg), Vault(b"z" * 32, style="natural")
+        raw = (
+            "<environment_context>\n"
+            "  <current_date>1999-01-02</current_date>\n"
+            "  <timezone>America/Los_Angeles</timezone>\n"
+            "</environment_context>\n"
+            "tmp is /private/var/folders/h1/0klcwbwj08l_vxxkjp1_0c8c0000gn/T/codex_1"
+        )
+        out, mapping = run(m, v, raw)
+        sydney_today = datetime.datetime.now(zoneinfo.ZoneInfo("Australia/Sydney")).strftime("%Y-%m-%d")
+        self.assertIn("<timezone>Australia/Sydney</timezone>", out)
+        self.assertIn(f"<current_date>{sydney_today}</current_date>", out)
+        self.assertNotIn("0klcwbwj08l_vxxkjp1_0c8c0000gn", out)
+        # Reversing surrogates restores the var/folders bucket cleanly while keeping normalized env tags
+        restored = RestoreDict(mapping).full(out)
+        self.assertIn("/private/var/folders/h1/0klcwbwj08l_vxxkjp1_0c8c0000gn/T/codex_1", restored)
+
+    def test_silent_cwd_folder_and_os_version_scrubbing(self):
+        import datetime
+        import zoneinfo
+        cfg = MaskConfig(surrogate_style="natural", mask_cwd=True, timezone="Australia/Sydney")
+        m, v = Masker(cfg), Vault(b"c" * 32, style="natural")
+        env_block = (
+            "<env>\n"
+            "Working directory: /Users/kestrel77/corp-clients/secret-bank-audit\n"
+            "OS Version: Darwin 25.6.0\n"
+            "Today's date: 2020-05-01\n"
+            "</env>\n"
+            "Writable root: `/Users/kestrel77/corp-clients/secret-bank-audit`.\n"
+            "def secret_bank_helper(): return '/Users/kestrel77/corp-clients/secret-bank-audit/main.py'"
+        )
+        out, mapping = run(m, v, env_block)
+        sydney_today = datetime.datetime.now(zoneinfo.ZoneInfo("Australia/Sydney")).strftime("%Y-%m-%d")
+        self.assertNotIn("kestrel77", out)
+        self.assertNotIn("corp-clients", out)
+        self.assertNotIn("secret-bank-audit", out)
+        self.assertNotIn("25.6.0", out)
+        self.assertIn("OS Version: Darwin 24.0.0", out)
+        self.assertIn(f"Today's date: {sydney_today}", out)
+        self.assertIn("workspace_", out)
+        self.assertIn("dir_", out)
+        # Reversing restores all path segments cleanly
+        restored = RestoreDict(mapping).full(out)
+        self.assertIn("/Users/kestrel77/corp-clients/secret-bank-audit/main.py", restored)
+
     def test_masking_is_idempotent(self):
         m, v = make(literals=("ACME",))
         text = r"C:\Users\kestrel77 bob@corp.io 10.0.0.7 ACME ghp_" + "Z9" * 18
@@ -198,6 +247,43 @@ class MaskingTests(unittest.TestCase):
         sr = RestoreDict(mapping, json_escape=True).stream()
         got = "".join(sr.feed(args[i:i + 3]) for i in range(0, len(args), 3)) + sr.flush()
         self.assertEqual(json.loads(got)["command"], f"dir {original}")
+
+    def test_naturalistic_surrogates_and_entropy_secrets(self):
+        cfg = MaskConfig(surrogate_style="natural", entropy_secrets=True, literals=("ByteSecretProj",))
+        m, v = Masker(cfg), Vault(b"n" * 32, style="natural")
+        rnd_tok = "K9mP2xQ8vL4nR7wY1zB5cF3hJ6tG0sD8"
+        sha = "a33a6db2e04597e6253f8b4e7c617602b7693cd7"
+        ident = "createStreamingResponseRestorerWithContext"
+        text = f"/Users/kestrel77/work alice@corp.cn github.com/my-org/my-repo {rnd_tok} {sha} {ident} ByteSecretProj"
+        out, mapping = run(m, v, text)
+        for hidden in ("kestrel77", "alice@corp.cn", "my-org", "my-repo", rnd_tok, "ByteSecretProj", "SECRET_"):
+            self.assertNotIn(hidden, out)
+        # git SHA and camelCase code identifiers must NOT be touched by entropy detection
+        self.assertIn(sha, out)
+        self.assertIn(ident, out)
+        self.assertIn("tok_test_", out)
+        self.assertRoundTrip(out, mapping, text)
+
+    def test_encrypted_vault_persistence_across_restart(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            vpath = os.path.join(tmp, "alice.vault")
+            cfg = MaskConfig(surrogate_style="natural")
+            m = Masker(cfg)
+            v1 = Vault(b"p" * 32, style="natural", persist_path=vpath)
+            early = "hello from kestrel77"
+            sent1, _ = run(m, v1, early)
+            m.learn("/Users/kestrel77/project", v1)
+            sent2, _ = run(m, v1, "later kestrel77")
+            v1.flush_disk()
+            with open(vpath, "rb") as f:
+                raw_disk = f.read()
+            self.assertNotIn(b"kestrel77", raw_disk)
+
+            # Simulate gateway restart: new Vault loads encrypted state from disk
+            v2 = Vault(b"p" * 32, style="natural", persist_path=vpath)
+            self.assertEqual(run(m, v2, early)[0], sent1)          # frozen history stays byte-identical!
+            self.assertEqual(run(m, v2, "later kestrel77")[0], sent2)
 
 
 if __name__ == "__main__":

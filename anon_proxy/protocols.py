@@ -32,6 +32,23 @@ MASK_SKIP_KEYS = frozenset({
 })
 SIGNED_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 BILLING_PREFIX = "x-anthropic-billing-header"
+SILENT_GIT_STATUS_RX = re.compile(
+    r"\n*# gitStatus\s*\ngitStatus:\s*This is the git status at the start of the conversation[\s\S]*?"
+    r"(?=\n# [A-Za-z_]|\s*</system-reminder>|\Z)"
+)
+EMPTY_REMINDER_RX = re.compile(
+    r"<system-reminder>\s*(?:As you answer the user's questions,\s*you can use the following context:\s*)?"
+    r"</system-reminder>\s*"
+)
+
+
+def strip_silent_git_status(text: str) -> str:
+    if "gitStatus:" not in text:
+        return text
+    cleaned = SILENT_GIT_STATUS_RX.sub("", text)
+    if "<system-reminder>" in cleaned:
+        cleaned = EMPTY_REMINDER_RX.sub("", cleaned)
+    return cleaned
 
 
 THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
@@ -42,6 +59,7 @@ class Privacy:
     end_user_id: str = "none"          # "none" | "pseudonym"
     force_store_false: bool = True
     strip_billing_header: bool = True
+    strip_silent_git: bool = True      # strip Claude Code's silent # gitStatus snapshot in <system-reminder>
     # Opus 5.5 / Fable 5.x reject replayed thinking blocks whose earlier history changed. Masking is
     # deterministic, but a gateway restart or a config change can still alter old turns; "drop_block"
     # makes the API drop those blocks instead of failing the request. "off" leaves the request alone.
@@ -159,11 +177,33 @@ def scrub_openai(endpoint: str, body: dict, ctx: RequestContext) -> dict:
     return mask_tree(body, ctx)
 
 
+def _strip_git_in_tree(obj) -> None:
+    if isinstance(obj, dict):
+        if obj.get("type") in SIGNED_BLOCK_TYPES:
+            return
+        for k, v in obj.items():
+            if k in MASK_SKIP_KEYS:
+                continue
+            if isinstance(v, str):
+                obj[k] = strip_silent_git_status(v)
+            elif isinstance(v, (dict, list)):
+                _strip_git_in_tree(v)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, str):
+                obj[i] = strip_silent_git_status(v)
+            elif isinstance(v, (dict, list)):
+                _strip_git_in_tree(v)
+
+
 def scrub_anthropic(endpoint: str, body: dict, ctx: RequestContext) -> dict:
     if ctx.privacy.end_user_id == "pseudonym":
         body["metadata"] = {"user_id": ctx.pseudo("end_user", "")}
     else:
         body.pop("metadata", None)
+
+    if ctx.privacy.strip_silent_git:
+        _strip_git_in_tree(body)
 
     system = body.get("system")
     if ctx.privacy.strip_billing_header:

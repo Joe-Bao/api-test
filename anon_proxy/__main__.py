@@ -32,7 +32,7 @@ def main(argv=None) -> int:
     if args.cmd == "mask":
         cfg = load_settings(args.config).mask if args.config else MaskConfig(keep=frozenset(DEFAULT_KEEP))
         text = args.text if args.text is not None else sys.stdin.read()
-        masker, vault = Masker(cfg), Vault(secrets.token_bytes(32))
+        masker, vault = Masker(cfg), Vault(secrets.token_bytes(32), style=cfg.surrogate_style)
         masker.learn(text, vault)
         used, stats = set(), Counter()
         print(masker.mask(text, vault, used, stats))
@@ -47,7 +47,8 @@ def main(argv=None) -> int:
     settings = load_settings(config)
     if getattr(args, "ask_keys", False):
         import getpass
-        for up in (settings.openai, settings.anthropic):
+        ups = (settings.anthropic,) if settings.provider.target == "anthropic" else (settings.openai, settings.anthropic)
+        for up in ups:
             if not upstream_key(up):
                 value = getpass.getpass(f"{up.api_key_env} (typing is hidden, Enter to skip): ").strip()
                 if value:
